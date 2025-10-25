@@ -1,3 +1,4 @@
+// Package indexer handles synchronization of Terraform modules from GitHub repositories.
 package indexer
 
 import (
@@ -14,6 +15,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dkooll/wamcp/internal/database"
@@ -21,6 +23,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -28,7 +31,10 @@ type Syncer struct {
 	db           *database.DB
 	githubClient *GitHubClient
 	org          string
+	workerCount  int
 }
+
+const defaultWorkerCount = 4
 
 type GitHubRepo struct {
 	Name        string `json:"name"`
@@ -103,7 +109,36 @@ func NewSyncer(db *database.DB, token string, org string) *Syncer {
 		db:           db,
 		githubClient: client,
 		org:          org,
+		workerCount:  defaultWorkerCount,
 	}
+}
+
+func (s *Syncer) workerCountFor(total int) int {
+	if total <= 1 {
+		if total < 1 {
+			return 0
+		}
+		return 1
+	}
+
+	count := s.workerCount
+	if count <= 0 {
+		count = defaultWorkerCount
+	}
+
+	if s.githubClient != nil && s.githubClient.rateLimit != nil && s.githubClient.rateLimit.maxTokens > 0 && count > s.githubClient.rateLimit.maxTokens {
+		count = s.githubClient.rateLimit.maxTokens
+	}
+
+	if count > total {
+		count = total
+	}
+
+	if count < 1 {
+		count = 1
+	}
+
+	return count
 }
 
 func (s *Syncer) SyncAll() (*SyncProgress, error) {
@@ -118,18 +153,7 @@ func (s *Syncer) SyncAll() (*SyncProgress, error) {
 	progress.TotalRepos = len(repos)
 	log.Printf("Found %d repositories", len(repos))
 
-	for _, repo := range repos {
-		progress.CurrentRepo = repo.Name
-		log.Printf("Syncing repository: %s (%d/%d)", repo.Name, progress.ProcessedRepos+1, progress.TotalRepos)
-
-		if err := s.syncRepository(repo); err != nil {
-			errMsg := fmt.Sprintf("Failed to sync %s: %v", repo.Name, err)
-			log.Println(errMsg)
-			progress.Errors = append(progress.Errors, errMsg)
-		}
-
-		progress.ProcessedRepos++
-	}
+	s.processRepoQueue(repos, progress, nil)
 
 	log.Printf("Sync completed: %d/%d repositories synced successfully",
 		progress.ProcessedRepos-len(progress.Errors), progress.TotalRepos)
@@ -150,37 +174,40 @@ func (s *Syncer) SyncUpdates() (*SyncProgress, error) {
 	progress.TotalRepos = len(repos)
 	log.Printf("Found %d repositories", len(repos))
 
+	reposToSync := make([]GitHubRepo, 0, len(repos))
+
 	for _, repo := range repos {
 		progress.CurrentRepo = repo.Name
 
 		existingModule, err := s.db.GetModule(repo.Name)
-
 		if err != nil {
 			log.Printf("Module %s not found in DB (error: %v), will sync", repo.Name, err)
-		} else if existingModule == nil {
+			reposToSync = append(reposToSync, repo)
+			continue
+		}
+
+		if existingModule == nil {
 			log.Printf("Module %s not found in DB (nil), will sync", repo.Name)
-		} else if existingModule.LastUpdated == repo.UpdatedAt {
+			reposToSync = append(reposToSync, repo)
+			continue
+		}
+
+		if existingModule.LastUpdated == repo.UpdatedAt {
 			log.Printf("Skipping %s (already up-to-date)", repo.Name)
 			progress.SkippedRepos++
 			progress.ProcessedRepos++
 			continue
-		} else {
-			log.Printf("Module %s needs update: DB='%s' vs GitHub='%s'", repo.Name, existingModule.LastUpdated, repo.UpdatedAt)
 		}
 
-		log.Printf("Syncing repository: %s (%d/%d)", repo.Name, progress.ProcessedRepos+1, progress.TotalRepos)
-
-		syncErr := s.syncRepository(repo)
-		if syncErr != nil {
-			errMsg := fmt.Sprintf("Failed to sync %s: %v", repo.Name, syncErr)
-			log.Println(errMsg)
-			progress.Errors = append(progress.Errors, errMsg)
-		} else {
-			progress.UpdatedRepos = append(progress.UpdatedRepos, repo.Name)
-		}
-
-		progress.ProcessedRepos++
+		log.Printf("Module %s needs update: DB='%s' vs GitHub='%s'", repo.Name, existingModule.LastUpdated, repo.UpdatedAt)
+		reposToSync = append(reposToSync, repo)
 	}
+
+	onSuccess := func(p *SyncProgress, repo GitHubRepo) {
+		p.UpdatedRepos = append(p.UpdatedRepos, repo.Name)
+	}
+
+	s.processRepoQueue(reposToSync, progress, onSuccess)
 
 	syncedCount := len(progress.UpdatedRepos)
 
@@ -188,6 +215,71 @@ func (s *Syncer) SyncUpdates() (*SyncProgress, error) {
 		syncedCount, progress.TotalRepos, progress.SkippedRepos, len(progress.Errors))
 
 	return progress, nil
+}
+
+func (s *Syncer) processRepoQueue(repos []GitHubRepo, progress *SyncProgress, onSuccess func(*SyncProgress, GitHubRepo)) {
+	if len(repos) == 0 {
+		return
+	}
+
+	workerCount := s.workerCountFor(len(repos))
+	var startedCounter atomic.Int64
+	var mu sync.Mutex
+	startOffset := int64(progress.ProcessedRepos)
+
+	handleRepo := func(repo GitHubRepo) {
+		seq := startOffset + startedCounter.Add(1)
+		log.Printf("Syncing repository: %s (%d/%d)", repo.Name, seq, progress.TotalRepos)
+
+		mu.Lock()
+		progress.CurrentRepo = repo.Name
+		mu.Unlock()
+
+		err := s.syncRepository(repo)
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to sync %s: %v", repo.Name, err)
+			log.Println(errMsg)
+			mu.Lock()
+			progress.Errors = append(progress.Errors, errMsg)
+			progress.ProcessedRepos++
+			progress.CurrentRepo = repo.Name
+			mu.Unlock()
+			return
+		}
+
+		mu.Lock()
+		progress.ProcessedRepos++
+		progress.CurrentRepo = repo.Name
+		if onSuccess != nil {
+			onSuccess(progress, repo)
+		}
+		mu.Unlock()
+	}
+
+	if workerCount <= 1 {
+		for _, repo := range repos {
+			handleRepo(repo)
+		}
+		return
+	}
+
+	jobs := make(chan GitHubRepo)
+	var wg sync.WaitGroup
+
+	for range workerCount {
+		wg.Go(func() {
+			for repo := range jobs {
+				handleRepo(repo)
+			}
+		})
+	}
+
+	for _, repo := range repos {
+		jobs <- repo
+	}
+
+	close(jobs)
+	wg.Wait()
 }
 
 func (s *Syncer) fetchRepositories() ([]GitHubRepo, error) {
@@ -264,6 +356,26 @@ func (s *Syncer) syncRepository(repo GitHubRepo) error {
 
 	if hasExamples {
 		s.markModuleHasExamples(moduleID)
+	}
+
+	// Persist tags for root and submodules to enable related-module queries and ranking.
+	if err := s.persistModuleTags(moduleID); err != nil {
+		log.Printf("Warning: failed to persist tags for %s: %v", repo.Name, err)
+	}
+	for _, childID := range submoduleIDs {
+		if err := s.persistModuleTags(childID); err != nil {
+			log.Printf("Warning: failed to persist tags for submodule %d of %s: %v", childID, repo.Name, err)
+		}
+	}
+
+	// Persist aliases for root and submodules to enable short-name resolution.
+	if err := s.persistModuleAliases(moduleID); err != nil {
+		log.Printf("Warning: failed to persist aliases for %s: %v", repo.Name, err)
+	}
+	for _, childID := range submoduleIDs {
+		if err := s.persistModuleAliases(childID); err != nil {
+			log.Printf("Warning: failed to persist aliases for submodule %d of %s: %v", childID, repo.Name, err)
+		}
 	}
 
 	return nil
@@ -347,6 +459,139 @@ func (s *Syncer) markModuleHasExamples(moduleID int64) {
 	if err := s.db.SetModuleHasExamples(moduleID, true); err != nil {
 		log.Printf("Warning: failed to flag module %d as having examples: %v", moduleID, err)
 	}
+}
+
+func (s *Syncer) persistModuleTags(moduleID int64) error {
+	module, err := s.db.GetModuleByID(moduleID)
+	if err != nil {
+		return err
+	}
+	resources, err := s.db.GetModuleResources(moduleID)
+	if err != nil {
+		return err
+	}
+
+	weights := make(map[string]int)
+
+	for _, r := range resources {
+		parts := strings.Split(r.ResourceType, "_")
+		for i, p := range parts {
+			if i == 0 {
+				continue
+			}
+			if len(p) <= 3 {
+				continue
+			}
+			weights[strings.ToLower(p)] += 2
+		}
+	}
+
+	name := module.Name
+	name = strings.ReplaceAll(name, "terraform-", "")
+	name = strings.ReplaceAll(name, "azure-", "")
+	name = strings.ReplaceAll(name, "//", "-")
+	lower := strings.ToLower(name)
+	for {
+		var token string
+		var ok bool
+		token, lower, ok = strings.Cut(lower, "-")
+		t := strings.TrimSpace(token)
+		if t != "" && t != "azure" && t != "modules" && t != "terraform" && len(t) > 3 {
+			weights[t] += 1
+		}
+		if !ok {
+			break
+		}
+	}
+
+	if err := s.db.ClearModuleTags(moduleID); err != nil {
+		log.Printf("Warning: failed clearing tags for %s: %v", module.Name, err)
+	}
+	for tag, w := range weights {
+		if err := s.db.InsertModuleTag(moduleID, tag, w, "derived"); err != nil {
+			log.Printf("Warning: failed inserting tag %s for %s: %v", tag, module.Name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Syncer) persistModuleAliases(moduleID int64) error {
+	module, err := s.db.GetModuleByID(moduleID)
+	if err != nil {
+		return err
+	}
+	tags, _ := s.db.GetModuleTags(moduleID)
+
+	name := module.Name
+	name = strings.TrimPrefix(name, "terraform-azure-")
+	name = strings.TrimPrefix(name, "terraform-")
+	name = strings.TrimPrefix(name, "azure-")
+	name = strings.ReplaceAll(name, "//modules/", "-")
+
+	tokens := []string{}
+	{
+		rest := name
+		for {
+			part, r, ok := strings.Cut(rest, "-")
+			t := strings.TrimSpace(part)
+			if t != "" && t != "modules" && t != "azure" && t != "terraform" {
+				tokens = append(tokens, t)
+			}
+			if !ok {
+				break
+			}
+			rest = r
+		}
+	}
+
+	type aliasW struct {
+		a string
+		w int
+	}
+	aliasMap := map[string]int{}
+	add := func(a string, w int) {
+		if a == "" {
+			return
+		}
+		a = strings.ToLower(a)
+		if len(a) < 2 {
+			return
+		}
+		if aliasMap[a] < w {
+			aliasMap[a] = w
+		}
+	}
+
+	add(strings.Join(tokens, "-"), 3)
+	if len(tokens) > 0 {
+		add(tokens[0], 3)
+	}
+	if len(tokens) > 1 {
+		add(tokens[len(tokens)-1], 2)
+	}
+	for _, t := range tokens {
+		add(t, 2)
+	}
+	if len(tokens) > 1 {
+		ac := ""
+		for _, t := range tokens {
+			ac += string(t[0])
+		}
+		add(ac, 1)
+	}
+	for _, tg := range tags {
+		add(tg.Tag, 1)
+	}
+
+	if err := s.db.ClearModuleAliases(moduleID); err != nil {
+		log.Printf("Warning: failed clearing aliases for %s: %v", module.Name, err)
+	}
+	for a, w := range aliasMap {
+		if err := s.db.InsertModuleAlias(moduleID, a, w, "derived"); err != nil {
+			log.Printf("Warning: failed inserting alias %s for %s: %v", a, module.Name, err)
+		}
+	}
+	return nil
 }
 
 func (s *Syncer) syncRepositoryFromArchive(moduleID int64, repo GitHubRepo) (bool, []int64, error) {
@@ -473,11 +718,16 @@ func shouldSkipPath(relativePath string) bool {
 		".terraform":   {},
 	}
 
-	segments := strings.Split(relativePath, "/")
-	for _, segment := range segments {
-		if _, skip := skipDirs[segment]; skip {
+	rest := relativePath
+	for {
+		seg, r, ok := strings.Cut(rest, "/")
+		if _, skip := skipDirs[seg]; skip {
 			return true
 		}
+		if !ok {
+			break
+		}
+		rest = r
 	}
 
 	return false
@@ -573,6 +823,8 @@ func (s *Syncer) parseAndIndexTerraformFile(moduleID int64, file database.Module
 	s.indexOutputs(moduleID, body, file.Content)
 	s.indexResources(moduleID, body, file.FileName)
 	s.indexDataSources(moduleID, body, file.FileName)
+	s.indexHCLBlocks(moduleID, file.FilePath, body)
+	s.indexRelationships(moduleID, file.FilePath, body)
 
 	return nil
 }
@@ -621,7 +873,7 @@ func parseHCLBody(content string, filename string) (*hclsyntax.Body, error) {
 	parser := hclparse.NewParser()
 	file, diags := parser.ParseHCL([]byte(content), filename)
 	if diags.HasErrors() {
-		return nil, fmt.Errorf(diags.Error())
+		return nil, fmt.Errorf("%s", diags.Error())
 	}
 
 	body, ok := file.Body.(*hclsyntax.Body)
@@ -749,6 +1001,195 @@ func attributeIsTrue(attr *hclsyntax.Attribute, content string) bool {
 
 	text := strings.TrimSpace(expressionText(content, attr.Expr.Range()))
 	return strings.EqualFold(text, "true")
+}
+
+func (s *Syncer) indexHCLBlocks(moduleID int64, filePath string, body *hclsyntax.Body) {
+	var walk func(b *hclsyntax.Body)
+	walk = func(b *hclsyntax.Body) {
+		for _, bl := range b.Blocks {
+			blockType := bl.Type
+			if blockType == "resource" || blockType == "dynamic" || blockType == "lifecycle" {
+				typeLabel := ""
+				if blockType == "resource" && len(bl.Labels) >= 2 {
+					typeLabel = bl.Labels[0]
+				} else if blockType == "dynamic" && len(bl.Labels) >= 1 {
+					typeLabel = bl.Labels[0]
+				}
+				rng := bl.Range()
+				start := int(rng.Start.Byte)
+				end := int(rng.End.Byte)
+				paths := collectAttrPaths(bl.Body, "")
+				attrPaths := strings.Join(paths, "\n")
+				_, err := s.db.InsertHCLBlock(moduleID, filePath, blockType, typeLabel, start, end, attrPaths)
+				if err != nil {
+					log.Printf("Warning: failed to insert hcl block %s in %s: %v", blockType, filePath, err)
+				}
+			}
+			if bl.Body != nil {
+				walk(bl.Body)
+			}
+		}
+	}
+	walk(body)
+}
+
+func collectAttrPaths(b *hclsyntax.Body, prefix string) []string {
+	var out []string
+	for k := range b.Attributes {
+		if prefix == "" {
+			out = append(out, k)
+		} else {
+			out = append(out, prefix+"."+k)
+		}
+	}
+	for _, nb := range b.Blocks {
+		p := nb.Type
+		if prefix != "" {
+			p = prefix + "." + nb.Type
+		}
+		out = append(out, p)
+		if nb.Body != nil {
+			out = append(out, collectAttrPaths(nb.Body, p)...)
+		}
+	}
+	return out
+}
+
+func (s *Syncer) indexRelationships(moduleID int64, filePath string, body *hclsyntax.Body) {
+	for _, block := range body.Blocks {
+		rels := collectRelationships(moduleID, filePath, block)
+		for _, rel := range rels {
+			if err := s.db.InsertRelationship(&rel); err != nil {
+				log.Printf("Warning: failed to insert relationship for %s: %v", filePath, err)
+			}
+		}
+	}
+}
+
+func collectRelationships(moduleID int64, filePath string, block *hclsyntax.Block) []database.HCLRelationship {
+	if block.Body == nil {
+		return nil
+	}
+
+	blockLabels := strings.Join(block.Labels, ".")
+	var results []database.HCLRelationship
+
+	var walk func(prefix string, body *hclsyntax.Body)
+	walk = func(prefix string, body *hclsyntax.Body) {
+		if body == nil {
+			return
+		}
+
+		for name, attr := range body.Attributes {
+			attrPath := joinAttributePath(prefix, name)
+			traversals := attr.Expr.Variables()
+			if len(traversals) == 0 {
+				continue
+			}
+
+			seen := make(map[string]struct{})
+			for _, traversal := range traversals {
+				refType, refName := classifyTraversal(traversal)
+				if refType == "" || refName == "" {
+					continue
+				}
+				if _, exists := seen[refName]; exists {
+					continue
+				}
+				seen[refName] = struct{}{}
+
+				rng := attr.Expr.Range()
+				results = append(results, database.HCLRelationship{
+					ModuleID:      moduleID,
+					FilePath:      filePath,
+					BlockType:     block.Type,
+					BlockLabels:   blockLabels,
+					AttributePath: attrPath,
+					ReferenceType: refType,
+					ReferenceName: refName,
+					StartByte:     int64(rng.Start.Byte),
+					EndByte:       int64(rng.End.Byte),
+				})
+			}
+		}
+
+		for _, child := range body.Blocks {
+			segment := child.Type
+			if len(child.Labels) > 0 {
+				segment = joinAttributePath(segment, strings.Join(child.Labels, "."))
+			}
+			walk(joinAttributePath(prefix, segment), child.Body)
+		}
+	}
+
+	walk("", block.Body)
+	return results
+}
+
+func joinAttributePath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	if name == "" {
+		return prefix
+	}
+	return prefix + "." + name
+}
+
+func classifyTraversal(traversal hcl.Traversal) (string, string) {
+	if len(traversal) == 0 {
+		return "", ""
+	}
+
+	root, ok := traversal[0].(hcl.TraverseRoot)
+	if !ok {
+		return "", ""
+	}
+
+	rootName := root.Name
+	refName := traversalToString(traversal)
+	if refName == "" {
+		return "", ""
+	}
+
+	switch rootName {
+	case "var":
+		return "variable", refName
+	case "local":
+		return "local", refName
+	case "module":
+		return "module_output", refName
+	case "data":
+		return "data_source", refName
+	case "path":
+		return "path", refName
+	case "terraform":
+		return "terraform", refName
+	case "each":
+		return "loop", refName
+	case "self":
+		return "self", refName
+	case "count":
+		return "count", refName
+	default:
+		if strings.Contains(rootName, "_") {
+			return "resource", refName
+		}
+		return "reference", refName
+	}
+}
+
+func traversalToString(traversal hcl.Traversal) string {
+	tokens := hclwrite.TokensForTraversal(traversal)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, tok := range tokens {
+		b.Write(tok.Bytes)
+	}
+	return b.String()
 }
 
 func expressionText(content string, rng hcl.Range) string {
@@ -957,25 +1398,38 @@ func parseNextLink(linkHeader string) string {
 		return ""
 	}
 
-	for _, part := range strings.Split(linkHeader, ",") {
-		sections := strings.Split(strings.TrimSpace(part), ";")
-		if len(sections) < 2 {
-			continue
-		}
-
-		urlPart := strings.Trim(sections[0], " <>")
-		var rel string
-		for _, sec := range sections[1:] {
-			sec = strings.TrimSpace(sec)
-			if trimmed, ok := strings.CutPrefix(sec, "rel="); ok {
-				rel = strings.Trim(trimmed, "\"")
+	rest := linkHeader
+	for {
+		part, r, ok := strings.Cut(rest, ",")
+		sections := strings.TrimSpace(part)
+		urlPart, params, ok2 := strings.Cut(sections, ";")
+		if ok2 {
+			urlPart = strings.Trim(urlPart, " <>")
+			rel := ""
+			p := params
+			for {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					break
+				}
+				var item string
+				item, p, _ = strings.Cut(p, ",")
+				item = strings.TrimSpace(item)
+				if trimmed, ok := strings.CutPrefix(item, "rel="); ok {
+					rel = strings.Trim(trimmed, "\"")
+				}
+				if p == "" {
+					break
+				}
+			}
+			if rel == "next" {
+				return urlPart
 			}
 		}
-
-		if rel == "next" {
-			return urlPart
+		if !ok {
+			break
 		}
+		rest = r
 	}
-
 	return ""
 }

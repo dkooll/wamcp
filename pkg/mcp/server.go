@@ -5,17 +5,24 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/dkooll/wamcp/internal/database"
 	"github.com/dkooll/wamcp/internal/formatter"
 	"github.com/dkooll/wamcp/internal/indexer"
+	"github.com/dkooll/wamcp/internal/util"
+	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 )
 
 type Message struct {
@@ -37,16 +44,27 @@ type ToolCallParams struct {
 	Arguments any    `json:"arguments"`
 }
 
+var errModuleNotInPrompt = errors.New("module not found in prompt")
+
 type Server struct {
 	db        *database.DB
 	syncer    *indexer.Syncer
 	writer    io.Writer
 	jobs      map[string]*SyncJob
 	jobsMutex sync.RWMutex
+	dbPath    string
+	token     string
+	org       string
+	dbMutex   sync.Mutex
 }
 
-func NewServer(db *database.DB, syncer *indexer.Syncer) *Server {
-	return &Server{db: db, syncer: syncer, jobs: make(map[string]*SyncJob)}
+func NewServer(dbPath, token, org string) *Server {
+	return &Server{
+		dbPath: dbPath,
+		token:  token,
+		org:    org,
+		jobs:   make(map[string]*SyncJob),
+	}
 }
 
 type SyncJob struct {
@@ -57,6 +75,27 @@ type SyncJob struct {
 	CompletedAt *time.Time
 	Progress    *indexer.SyncProgress
 	Error       string
+}
+
+func (s *Server) ensureDB() error {
+	s.dbMutex.Lock()
+	defer s.dbMutex.Unlock()
+
+	if s.db != nil {
+		return nil
+	}
+
+	log.Printf("Initializing database at: %s", s.dbPath)
+	db, err := database.New(s.dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	s.db = db
+	s.syncer = indexer.NewSyncer(db, s.token, s.org)
+	log.Println("Database initialized successfully")
+
+	return nil
 }
 
 func (s *Server) Run(ctx context.Context, r io.Reader, w io.Writer) error {
@@ -201,6 +240,19 @@ func (s *Server) handleToolsList(msg Message) {
 						"type":        "number",
 						"description": "Maximum number of results (default: 20)",
 					},
+					"kind": map[string]any{
+						"type":        "string",
+						"description": "Optional structural filter: resource|dynamic|lifecycle",
+					},
+					"type_prefix": map[string]any{
+						"type":        "string",
+						"description": "Optional resource type prefix (e.g., azurerm_storage_account)",
+					},
+					"has": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Optional attribute presence filters (e.g., for_each, lifecycle.ignore_changes)",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -269,6 +321,31 @@ func (s *Server) handleToolsList(msg Message) {
 					},
 				},
 				"required": []string{"pattern"},
+			},
+		},
+		{
+			"name":        "analyze_code_relationships",
+			"description": "Reveal how a term is referenced within a module by leveraging indexed Terraform relationships (variables, resources, data sources). Accepts structured arguments or a natural-language prompt like 'Show subnet usage in redis.'",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"module_name": map[string]any{
+						"type":        "string",
+						"description": "Name or alias of the module to inspect",
+					},
+					"query": map[string]any{
+						"type":        "string",
+						"description": "Term to match against attribute paths or reference names (e.g., 'subnet')",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "Optional: maximum number of relationships to return (default 20)",
+					},
+					"prompt": map[string]any{
+						"type":        "string",
+						"description": "Natural-language request (e.g., 'Show subnet relationships in redis, top 5').",
+					},
+				},
 			},
 		},
 		{
@@ -363,6 +440,8 @@ func (s *Server) handleToolsCall(msg Message) {
 		result = s.handleExtractVariableDefinition(params.Arguments)
 	case "compare_pattern_across_modules":
 		result = s.handleComparePatternAcrossModules(params.Arguments)
+	case "analyze_code_relationships":
+		result = s.handleAnalyzeCodeRelationships(params.Arguments)
 	case "list_module_examples":
 		result = s.handleListModuleExamples(params.Arguments)
 	case "get_example_content":
@@ -383,6 +462,10 @@ func (s *Server) handleToolsCall(msg Message) {
 }
 
 func (s *Server) handleSyncModules() map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	job := s.startSyncJob("full_sync", func() (*indexer.SyncProgress, error) {
 		log.Println("Starting full repository sync (async job)...")
 		return s.syncer.SyncAll()
@@ -399,6 +482,10 @@ func (s *Server) handleSyncModules() map[string]any {
 }
 
 func (s *Server) handleSyncUpdatesModules() map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	log.Println("Starting incremental repository sync (updates only)...")
 
 	progress, err := s.syncer.SyncUpdates()
@@ -441,6 +528,10 @@ func (s *Server) handleSyncStatus(args any) map[string]any {
 }
 
 func (s *Server) handleListModules() map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	modules, err := s.db.ListModules()
 	if err != nil {
 		return ErrorResponse(fmt.Sprintf("Error loading modules: %v", err))
@@ -455,6 +546,10 @@ func (s *Server) handleListModules() map[string]any {
 }
 
 func (s *Server) handleSearchModules(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	searchArgs, err := UnmarshalArgs[struct {
 		Query string `json:"query"`
 		Limit int    `json:"limit"`
@@ -467,16 +562,38 @@ func (s *Server) handleSearchModules(args any) map[string]any {
 		searchArgs.Limit = 10
 	}
 
-	modules, err := s.db.SearchModules(searchArgs.Query, searchArgs.Limit)
-	if err != nil {
-		return ErrorResponse(fmt.Sprintf("Error searching modules: %v", err))
+	variants := util.ExpandQueryVariants(searchArgs.Query)
+	seen := make(map[int64]struct{})
+	var merged []database.Module
+	for _, v := range variants {
+		mods, err := s.db.SearchModules(v, searchArgs.Limit)
+		if err != nil {
+			continue
+		}
+		for _, m := range mods {
+			if _, ok := seen[m.ID]; ok {
+				continue
+			}
+			seen[m.ID] = struct{}{}
+			merged = append(merged, m)
+			if searchArgs.Limit > 0 && len(merged) >= searchArgs.Limit {
+				break
+			}
+		}
+		if searchArgs.Limit > 0 && len(merged) >= searchArgs.Limit {
+			break
+		}
 	}
 
-	text := formatter.SearchResults(searchArgs.Query, modules)
+	text := formatter.SearchResults(searchArgs.Query, merged)
 	return SuccessResponse(text)
 }
 
 func (s *Server) handleGetModuleInfo(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	moduleArgs, err := UnmarshalArgs[struct {
 		ModuleName string `json:"module_name"`
 	}](args)
@@ -484,7 +601,7 @@ func (s *Server) handleGetModuleInfo(args any) map[string]any {
 		return ErrorResponse("Error: Invalid module name")
 	}
 
-	module, err := s.db.GetModule(moduleArgs.ModuleName)
+	module, err := s.resolveModule(moduleArgs.ModuleName)
 	if err != nil {
 		return ErrorResponse(fmt.Sprintf("Module '%s' not found", moduleArgs.ModuleName))
 	}
@@ -494,14 +611,25 @@ func (s *Server) handleGetModuleInfo(args any) map[string]any {
 	resources, _ := s.db.GetModuleResources(module.ID)
 	files, _ := s.db.GetModuleFiles(module.ID)
 
+	summary, _ := s.db.SummarizeModuleStructure(module.ID)
 	text := formatter.ModuleInfo(module, variables, outputs, resources, files)
+	if summary != nil {
+		text += formatter.StructuralSummaryValues(summary.ResourceCount, summary.LifecycleCount, summary.ResourcesWithIgnoreChanges, summary.TopResourceTypes, summary.DynamicLabels)
+	}
 	return SuccessResponse(text)
 }
 
 func (s *Server) handleSearchCode(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	searchArgs, err := UnmarshalArgs[struct {
-		Query string `json:"query"`
-		Limit int    `json:"limit"`
+		Query      string   `json:"query"`
+		Limit      int      `json:"limit"`
+		Kind       string   `json:"kind"`
+		TypePrefix string   `json:"type_prefix"`
+		Has        []string `json:"has"`
 	}](args)
 	if err != nil {
 		return ErrorResponse("Error: Invalid search query")
@@ -511,9 +639,45 @@ func (s *Server) handleSearchCode(args any) map[string]any {
 		searchArgs.Limit = 20
 	}
 
-	files, err := s.db.SearchFiles(searchArgs.Query, searchArgs.Limit)
-	if err != nil {
-		return ErrorResponse(fmt.Sprintf("Error searching code: %v", err))
+	variants := util.ExpandQueryVariants(searchArgs.Query)
+	if len(variants) == 0 {
+		variants = []string{searchArgs.Query}
+	}
+
+	seen := make(map[int64]struct{})
+	var merged []database.ModuleFile
+	var files []database.ModuleFile
+	if len(variants) == 1 {
+		files, _ = s.db.SearchFiles(variants[0], searchArgs.Limit)
+	} else {
+		parts := make([]string, 0, len(variants))
+		for _, v := range variants {
+			escaped := strings.ReplaceAll(v, "\"", "\"\"")
+			parts = append(parts, fmt.Sprintf("\"%s\"", escaped))
+		}
+		match := strings.Join(parts, " OR ")
+		files, _ = s.db.SearchFilesFTS(match, searchArgs.Limit)
+	}
+
+	for _, f := range files {
+		if _, ok := seen[f.ID]; ok {
+			continue
+		}
+		if searchArgs.Kind != "" || searchArgs.TypePrefix != "" || len(searchArgs.Has) > 0 {
+			mod, merr := s.db.GetModuleByID(f.ModuleID)
+			if merr != nil {
+				continue
+			}
+			okStruct, herr := s.db.HCLBlockExists(mod.ID, f.FilePath, searchArgs.Kind, searchArgs.TypePrefix, searchArgs.Has)
+			if herr != nil || !okStruct {
+				continue
+			}
+		}
+		seen[f.ID] = struct{}{}
+		merged = append(merged, f)
+		if searchArgs.Limit > 0 && len(merged) >= searchArgs.Limit {
+			break
+		}
 	}
 
 	getModuleName := func(moduleID int64) string {
@@ -524,11 +688,15 @@ func (s *Server) handleSearchCode(args any) map[string]any {
 		return "unknown"
 	}
 
-	text := formatter.CodeSearchResults(searchArgs.Query, files, getModuleName)
+	text := formatter.CodeSearchResults(searchArgs.Query, merged, getModuleName)
 	return SuccessResponse(text)
 }
 
 func (s *Server) handleGetFileContent(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	fileArgs, err := UnmarshalArgs[struct {
 		ModuleName string `json:"module_name"`
 		FilePath   string `json:"file_path"`
@@ -537,16 +705,24 @@ func (s *Server) handleGetFileContent(args any) map[string]any {
 		return ErrorResponse("Error: Invalid parameters")
 	}
 
-	file, err := s.db.GetFile(fileArgs.ModuleName, fileArgs.FilePath)
+	module, err := s.resolveModule(fileArgs.ModuleName)
 	if err != nil {
-		return ErrorResponse(fmt.Sprintf("File '%s' not found in module '%s'", fileArgs.FilePath, fileArgs.ModuleName))
+		return ErrorResponse(fmt.Sprintf("Module '%s' not found", fileArgs.ModuleName))
+	}
+	file, err := s.db.GetFile(module.Name, fileArgs.FilePath)
+	if err != nil {
+		return ErrorResponse(fmt.Sprintf("File '%s' not found in module '%s'", fileArgs.FilePath, module.Name))
 	}
 
-	text := formatter.FileContent(fileArgs.ModuleName, file.FilePath, file.FileType, file.SizeBytes, file.Content)
+	text := formatter.FileContent(module.Name, file.FilePath, file.FileType, file.SizeBytes, file.Content)
 	return SuccessResponse(text)
 }
 
 func (s *Server) handleExtractVariableDefinition(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	varArgs, err := UnmarshalArgs[struct {
 		ModuleName   string `json:"module_name"`
 		VariableName string `json:"variable_name"`
@@ -555,9 +731,13 @@ func (s *Server) handleExtractVariableDefinition(args any) map[string]any {
 		return ErrorResponse("Error: Invalid parameters")
 	}
 
-	file, err := s.db.GetFile(varArgs.ModuleName, "variables.tf")
+	module, err := s.resolveModule(varArgs.ModuleName)
 	if err != nil {
-		return ErrorResponse(fmt.Sprintf("variables.tf not found in module '%s'", varArgs.ModuleName))
+		return ErrorResponse(fmt.Sprintf("Module '%s' not found", varArgs.ModuleName))
+	}
+	file, err := s.db.GetFile(module.Name, "variables.tf")
+	if err != nil {
+		return ErrorResponse(fmt.Sprintf("variables.tf not found in module '%s'", module.Name))
 	}
 
 	variableBlock := extractVariableBlock(file.Content, varArgs.VariableName)
@@ -565,7 +745,7 @@ func (s *Server) handleExtractVariableDefinition(args any) map[string]any {
 		return ErrorResponse(fmt.Sprintf("Variable '%s' not found in %s", varArgs.VariableName, varArgs.ModuleName))
 	}
 
-	text := formatter.VariableDefinition(varArgs.ModuleName, varArgs.VariableName, variableBlock)
+	text := formatter.VariableDefinition(module.Name, varArgs.VariableName, variableBlock)
 	return SuccessResponse(text)
 }
 
@@ -600,6 +780,10 @@ Loop:
 }
 
 func (s *Server) handleComparePatternAcrossModules(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	patternArgs, err := UnmarshalArgs[struct {
 		Pattern        string `json:"pattern"`
 		FileType       string `json:"file_type"`
@@ -635,8 +819,437 @@ func (s *Server) handleComparePatternAcrossModules(args any) map[string]any {
 	return SuccessResponse(text)
 }
 
+func (s *Server) handleAnalyzeCodeRelationships(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
+	moduleName, query, limit, prompt, err := parseRelationshipArgs(args)
+	if err != nil {
+		return ErrorResponse(fmt.Sprintf("Error: %v", err))
+	}
+
+	moduleName = strings.TrimSpace(moduleName)
+	query = strings.TrimSpace(query)
+	prompt = strings.TrimSpace(prompt)
+
+	var module *database.Module
+
+	if prompt != "" {
+		parsedModule, parsedQuery, parsedLimit, parseErr := s.interpretRelationshipPrompt(prompt)
+		if parseErr != nil {
+			return ErrorResponse(fmt.Sprintf("Could not interpret prompt: %v", parseErr))
+		}
+		if moduleName == "" && parsedModule != nil {
+			module = parsedModule
+		}
+		if query == "" {
+			query = parsedQuery
+		}
+		if limit == 0 && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	if module == nil && moduleName != "" {
+		module, err = s.resolveModule(moduleName)
+		if err != nil {
+			return ErrorResponse(fmt.Sprintf("Module '%s' not found", moduleName))
+		}
+	}
+
+	if query == "" {
+		return ErrorResponse("Error: query missing. Provide `query` or specify what you are looking for in the prompt.")
+	}
+
+	return s.runRelationshipQuery(module, query, limit)
+}
+
+func (s *Server) runRelationshipQuery(module *database.Module, query string, limit int) map[string]any {
+	if module != nil {
+		rels, err := s.db.QueryRelationships(module.ID, query, limit)
+		if err != nil {
+			return ErrorResponse(fmt.Sprintf("Failed to load relationships: %v", err))
+		}
+
+		if len(rels) == 0 {
+			return SuccessResponse(fmt.Sprintf("No relationships matching '%s' found in module '%s'.", query, module.Name))
+		}
+
+		files, err := s.db.GetModuleFiles(module.ID)
+		if err != nil {
+			return ErrorResponse(fmt.Sprintf("Failed to load module files: %v", err))
+		}
+
+		fileMap := make(map[string]database.ModuleFile, len(files))
+		for _, file := range files {
+			fileMap[file.FilePath] = file
+		}
+
+		text := formatter.RelationshipAnalysis(module.Name, query, rels, fileMap)
+		if limit > 0 && len(rels) == limit {
+			text += fmt.Sprintf("\n_Note: Showing the first %d matches. Increase `limit` to see more._\n", limit)
+		}
+
+		return SuccessResponse(text)
+	}
+
+	rels, err := s.db.QueryRelationshipsAny(query, limit)
+	if err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to load relationships: %v", err))
+	}
+
+	if len(rels) == 0 {
+		return SuccessResponse(fmt.Sprintf("No relationships matching '%s' found across modules.", query))
+	}
+
+	buckets := make(map[int64][]database.HCLRelationship)
+	for _, rel := range rels {
+		buckets[rel.ModuleID] = append(buckets[rel.ModuleID], rel)
+	}
+
+	views := make([]formatter.ModuleRelationshipView, 0, len(buckets))
+	for moduleID, items := range buckets {
+		mod, err := s.db.GetModuleByID(moduleID)
+		if err != nil {
+			log.Printf("Warning: failed to load module %d for relationships: %v", moduleID, err)
+			continue
+		}
+
+		files, err := s.db.GetModuleFiles(moduleID)
+		if err != nil {
+			log.Printf("Warning: failed to load files for module %s: %v", mod.Name, err)
+			continue
+		}
+
+		fileMap := make(map[string]database.ModuleFile, len(files))
+		for _, file := range files {
+			fileMap[file.FilePath] = file
+		}
+
+		views = append(views, formatter.ModuleRelationshipView{
+			ModuleName:    mod.Name,
+			Relationships: items,
+			Files:         fileMap,
+		})
+	}
+
+	if len(views) == 0 {
+		return SuccessResponse(fmt.Sprintf("No relationships matching '%s' found across modules.", query))
+	}
+
+	text := formatter.RelationshipAnalysisAcross(query, views)
+	if limit > 0 && len(rels) == limit {
+		text += fmt.Sprintf("\n_Note: Showing the first %d matches overall. Increase `limit` to see more._\n", limit)
+	}
+
+	return SuccessResponse(text)
+}
+
+func parseRelationshipArgs(raw any) (moduleName, query string, limit int, prompt string, err error) {
+	if raw == nil {
+		return "", "", 0, "", nil
+	}
+
+	switch v := raw.(type) {
+	case string:
+		return "", "", 0, v, nil
+	case map[string]any:
+		if val, ok := v["module_name"]; ok {
+			s, ok := val.(string)
+			if !ok {
+				return "", "", 0, "", fmt.Errorf("module_name must be a string")
+			}
+			moduleName = s
+		}
+		if val, ok := v["query"]; ok {
+			s, ok := val.(string)
+			if !ok {
+				return "", "", 0, "", fmt.Errorf("query must be a string")
+			}
+			query = s
+		}
+		if val, ok := v["prompt"]; ok {
+			s, ok := val.(string)
+			if !ok {
+				return "", "", 0, "", fmt.Errorf("prompt must be a string")
+			}
+			prompt = s
+		}
+		if val, ok := v["limit"]; ok {
+			switch t := val.(type) {
+			case float64:
+				limit = int(t)
+			case int:
+				limit = t
+			case json.Number:
+				n, err := t.Int64()
+				if err != nil {
+					return "", "", 0, "", fmt.Errorf("limit must be numeric")
+				}
+				limit = int(n)
+			case string:
+				if strings.TrimSpace(t) == "" {
+					limit = 0
+					break
+				}
+				n, err := strconv.Atoi(t)
+				if err != nil {
+					return "", "", 0, "", fmt.Errorf("limit must be numeric")
+				}
+				limit = n
+			default:
+				return "", "", 0, "", fmt.Errorf("limit must be numeric")
+			}
+		}
+		return
+	default:
+		// try JSON round-trip for other shapes (e.g., struct)
+		bytes, marshalErr := json.Marshal(raw)
+		if marshalErr != nil {
+			return "", "", 0, "", fmt.Errorf("unsupported parameter format")
+		}
+		var tmp struct {
+			ModuleName string `json:"module_name"`
+			Query      string `json:"query"`
+			Limit      int    `json:"limit"`
+			Prompt     string `json:"prompt"`
+		}
+		if err := json.Unmarshal(bytes, &tmp); err != nil {
+			return "", "", 0, "", fmt.Errorf("invalid parameters")
+		}
+		return tmp.ModuleName, tmp.Query, tmp.Limit, tmp.Prompt, nil
+	}
+}
+
+func (s *Server) interpretRelationshipPrompt(prompt string) (*database.Module, string, int, error) {
+	original := strings.TrimSpace(prompt)
+	if original == "" {
+		return nil, "", 0, fmt.Errorf("prompt is empty")
+	}
+
+	limit, cleaned := extractPromptLimit(original)
+	tokens := tokenizePrompt(cleaned)
+	if len(tokens) == 0 {
+		return nil, "", limit, fmt.Errorf("could not find useful words")
+	}
+
+	module, moduleIdx, err := s.findModuleFromTokens(tokens)
+	if err != nil && !errors.Is(err, errModuleNotInPrompt) {
+		return nil, "", limit, err
+	}
+
+	query := deriveQueryFromTokens(tokens, moduleIdx)
+	if query == "" {
+		return module, "", limit, fmt.Errorf("could not identify what to search for")
+	}
+
+	return module, query, limit, nil
+}
+
+func extractPromptLimit(prompt string) (int, string) {
+	limitRegex := regexp.MustCompile(`(?i)\b(?:top|first|limit)\s+(\d{1,3})\b`)
+	limit := 0
+	cleaned := limitRegex.ReplaceAllStringFunc(prompt, func(match string) string {
+		parts := limitRegex.FindStringSubmatch(match)
+		if len(parts) > 1 {
+			if parsed, err := strconv.Atoi(parts[1]); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		return ""
+	})
+	return limit, cleaned
+}
+
+type promptToken struct {
+	Original string
+	Lower    string
+}
+
+func tokenizePrompt(input string) []promptToken {
+	splitFn := func(r rune) bool {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '/' || r == '_' || r == '-' {
+			return false
+		}
+		return true
+	}
+
+	raw := strings.FieldsFunc(input, splitFn)
+	tokens := make([]promptToken, 0, len(raw))
+	for _, part := range raw {
+		if part == "" {
+			continue
+		}
+		tokens = append(tokens, promptToken{Original: part, Lower: strings.ToLower(part)})
+	}
+	return tokens
+}
+
+func (s *Server) findModuleFromTokens(tokens []promptToken) (*database.Module, []int, error) {
+	if len(tokens) == 0 {
+		return nil, nil, fmt.Errorf("no tokens available")
+	}
+
+	maxWindow := min(3, len(tokens))
+
+	tried := make(map[string]struct{})
+
+	for window := maxWindow; window >= 1; window-- {
+		for start := len(tokens) - window; start >= 0; start-- {
+			segment := tokens[start : start+window]
+			forms := candidateModuleForms(segment)
+			for _, candidate := range forms {
+				if candidate == "" {
+					continue
+				}
+				if _, seen := tried[candidate]; seen {
+					continue
+				}
+				tried[candidate] = struct{}{}
+				module, err := s.resolveModule(candidate)
+				if err == nil {
+					indices := make([]int, window)
+					for i := 0; i < window; i++ {
+						indices[i] = start + i
+					}
+					return module, indices, nil
+				}
+			}
+		}
+	}
+
+	return nil, nil, errModuleNotInPrompt
+}
+
+func candidateModuleForms(tokens []promptToken) []string {
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		parts[i] = t.Lower
+	}
+
+	set := make(map[string]struct{})
+	push := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			set[s] = struct{}{}
+		}
+	}
+
+	push(strings.Join(parts, " "))
+	if len(parts) > 1 {
+		push(strings.Join(parts, "-"))
+		push(strings.Join(parts, "_"))
+	}
+	push(strings.Join(parts, ""))
+
+	forms := make([]string, 0, len(set))
+	for key := range set {
+		forms = append(forms, key)
+	}
+	return forms
+}
+
+var relationshipStopwords = map[string]struct{}{
+	"show":          {},
+	"me":            {},
+	"please":        {},
+	"the":           {},
+	"a":             {},
+	"an":            {},
+	"module":        {},
+	"modules":       {},
+	"relationship":  {},
+	"relationships": {},
+	"in":            {},
+	"within":        {},
+	"inside":        {},
+	"for":           {},
+	"of":            {},
+	"on":            {},
+	"about":         {},
+	"across":        {},
+	"with":          {},
+	"to":            {},
+	"and":           {},
+	"all":           {},
+	"any":           {},
+	"find":          {},
+	"list":          {},
+	"see":           {},
+	"need":          {},
+	"want":          {},
+	"how":           {},
+	"do":            {},
+	"does":          {},
+	"display":       {},
+	"get":           {},
+	"showing":       {},
+	"tell":          {},
+	"explain":       {},
+	"look":          {},
+	"into":          {},
+	"where":         {},
+	"which":         {},
+	"top":           {},
+	"first":         {},
+	"limit":         {},
+	"results":       {},
+	"matches":       {},
+}
+
+func deriveQueryFromTokens(tokens []promptToken, moduleIdx []int) string {
+	indexSet := make(map[int]struct{}, len(moduleIdx))
+	for _, idx := range moduleIdx {
+		indexSet[idx] = struct{}{}
+	}
+
+	var focusTokens []promptToken
+	if len(moduleIdx) > 0 {
+		first := moduleIdx[0]
+		if first > 0 {
+			focusTokens = append(focusTokens, tokens[:first]...)
+		} else if last := moduleIdx[len(moduleIdx)-1]; last+1 < len(tokens) {
+			focusTokens = append(focusTokens, tokens[last+1:]...)
+		}
+	}
+
+	if len(focusTokens) == 0 {
+		for i, tok := range tokens {
+			if _, isModule := indexSet[i]; isModule {
+				continue
+			}
+			focusTokens = append(focusTokens, tok)
+		}
+	}
+
+	var filtered []string
+	for _, tok := range focusTokens {
+		if _, stop := relationshipStopwords[tok.Lower]; stop {
+			continue
+		}
+		if _, err := strconv.Atoi(tok.Lower); err == nil {
+			continue
+		}
+		filtered = append(filtered, tok.Original)
+	}
+
+	if len(filtered) == 0 {
+		for _, tok := range focusTokens {
+			filtered = append(filtered, tok.Original)
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(filtered, " "))
+}
+
 func (s *Server) findPatternMatches(modules []database.Module, pattern, fileType string) []formatter.PatternMatch {
 	var results []formatter.PatternMatch
+
+	indexed := s.findPatternMatchesIndexed(pattern, fileType)
+	if len(indexed) > 0 {
+		return indexed
+	}
 
 	for _, module := range modules {
 		files, err := s.db.GetModuleFiles(module.ID)
@@ -653,7 +1266,12 @@ func (s *Server) findPatternMatches(modules []database.Module, pattern, fileType
 				continue
 			}
 
-			matches := extractPatternMatches(file.Content, pattern)
+			matches := extractASTPatternMatches(file.Content, pattern)
+			if len(matches) == 0 {
+				for _, m := range extractPatternMatches(file.Content, pattern) {
+					matches = append(matches, astMatch{Code: m, BlockType: "", Summary: ""})
+				}
+			}
 			for i, match := range matches {
 				displayName := module.Name
 				if len(matches) > 1 {
@@ -662,13 +1280,282 @@ func (s *Server) findPatternMatches(modules []database.Module, pattern, fileType
 				results = append(results, formatter.PatternMatch{
 					ModuleName: displayName,
 					FileName:   file.FileName,
-					Match:      match,
+					Match:      match.Code,
+					BlockType:  match.BlockType,
+					Summary:    match.Summary,
 				})
 			}
 		}
 	}
 
 	return results
+}
+
+func (s *Server) findPatternMatchesIndexed(pattern, fileType string) []formatter.PatternMatch {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return nil
+	}
+
+	hasFilters := parseHasFilters(trimmed)
+	var blocks []database.HCLBlock
+	var err error
+	blockType := ""
+	typeLabel := ""
+	prefix := false
+
+	if want, ok := getQuotedArg(trimmed, "resource"); ok {
+		blockType = "resource"
+		typeLabel = want
+		prefix = true
+	} else if want, ok := getQuotedArg(trimmed, "dynamic"); ok {
+		blockType = "dynamic"
+		typeLabel = want
+		prefix = false
+	} else if strings.HasPrefix(trimmed, "lifecycle") {
+		blockType = "lifecycle"
+	} else {
+		return nil
+	}
+
+	blocks, err = s.db.QueryHCLBlocks(blockType, typeLabel, prefix)
+	if err != nil || len(blocks) == 0 {
+		return nil
+	}
+
+	var results []formatter.PatternMatch
+	for _, b := range blocks {
+		if fileType != "" && !strings.HasSuffix(b.FilePath, "/"+fileType) && !strings.HasSuffix(b.FilePath, fileType) {
+			continue
+		}
+		if len(hasFilters) > 0 {
+			ok := true
+			attrSet := make(map[string]struct{})
+			if b.AttrPaths.Valid {
+				rest := b.AttrPaths.String
+				for {
+					line, r, cut := strings.Cut(rest, "\n")
+					if line != "" {
+						attrSet[line] = struct{}{}
+					}
+					if !cut {
+						break
+					}
+					rest = r
+				}
+			}
+			for _, f := range hasFilters {
+				if _, present := attrSet[f]; !present {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+
+		module, merr := s.db.GetModuleByID(b.ModuleID)
+		if merr != nil {
+			continue
+		}
+		f, ferr := s.db.GetFile(module.Name, b.FilePath)
+		if ferr != nil {
+			continue
+		}
+		start := int(b.StartByte)
+		end := int(b.EndByte)
+		if start < 0 {
+			start = 0
+		}
+		if end > len(f.Content) {
+			end = len(f.Content)
+		}
+		if end < start {
+			end = start
+		}
+		code := strings.TrimSpace(f.Content[start:end])
+
+		results = append(results, formatter.PatternMatch{
+			ModuleName: module.Name,
+			FileName:   f.FileName,
+			Match:      code,
+			BlockType:  blockType,
+			Summary:    "",
+		})
+	}
+	return results
+}
+
+type astMatch struct {
+	Code      string
+	BlockType string
+	Summary   string
+}
+
+func extractASTPatternMatches(content, pattern string) []astMatch {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return nil
+	}
+
+	parser := hclparse.NewParser()
+	file, diags := parser.ParseHCL([]byte(content), "temp.tf")
+	if diags.HasErrors() {
+		return nil
+	}
+	body, ok := file.Body.(*hclsyntax.Body)
+	if !ok {
+		return nil
+	}
+
+	sliceBlock := func(b *hclsyntax.Block) string {
+		rng := b.Range()
+		start := rng.Start.Byte
+		end := rng.End.Byte
+		if start < 0 {
+			start = 0
+		}
+		if end > len(content) {
+			end = len(content)
+		}
+		if end < start {
+			end = start
+		}
+		return strings.TrimSpace(content[start:end])
+	}
+
+	var out []astMatch
+
+	hasFilters := parseHasFilters(trimmed)
+
+	if want, ok := getQuotedArg(trimmed, "resource"); ok {
+		for _, bl := range body.Blocks {
+			if bl.Type == "resource" && len(bl.Labels) >= 2 {
+				rtype := bl.Labels[0]
+				if strings.HasPrefix(rtype, want) && blockSatisfies(bl.Body, hasFilters) {
+					out = append(out, astMatch{Code: sliceBlock(bl), BlockType: "resource", Summary: summarizeAttributes("resource", bl)})
+				}
+			}
+		}
+		return out
+	}
+
+	if want, ok := getQuotedArg(trimmed, "dynamic"); ok {
+
+		var walk func(bdy *hclsyntax.Body)
+		walk = func(bdy *hclsyntax.Body) {
+			for _, bl := range bdy.Blocks {
+				if bl.Type == "dynamic" && len(bl.Labels) > 0 && bl.Labels[0] == want && blockSatisfies(bl.Body, hasFilters) {
+					out = append(out, astMatch{Code: sliceBlock(bl), BlockType: "dynamic", Summary: summarizeAttributes("dynamic", bl)})
+				}
+				if bl.Body != nil {
+					walk(bl.Body)
+				}
+			}
+		}
+		walk(body)
+		return out
+	}
+
+	if strings.HasPrefix(trimmed, "lifecycle") {
+		var walk func(bdy *hclsyntax.Body)
+		walk = func(bdy *hclsyntax.Body) {
+			for _, bl := range bdy.Blocks {
+				if bl.Type == "lifecycle" && blockSatisfies(bl.Body, hasFilters) {
+					out = append(out, astMatch{Code: sliceBlock(bl), BlockType: "lifecycle", Summary: summarizeAttributes("lifecycle", bl)})
+				}
+				if bl.Body != nil {
+					walk(bl.Body)
+				}
+			}
+		}
+		walk(body)
+		return out
+	}
+
+	return nil
+}
+
+func getQuotedArg(pattern, keyword string) (string, bool) {
+	prefix := keyword + " "
+	if !strings.HasPrefix(pattern, prefix) {
+		return "", false
+	}
+	rest := pattern[len(prefix):]
+	first := strings.IndexByte(rest, '"')
+	if first < 0 {
+		return "", false
+	}
+	second := strings.IndexByte(rest[first+1:], '"')
+	if second < 0 {
+		return "", false
+	}
+	want := strings.TrimSpace(rest[first+1 : first+1+second])
+	return want, want != ""
+}
+
+func parseHasFilters(pattern string) []string {
+	toks := strings.Fields(pattern)
+	var filters []string
+	for _, t := range toks {
+		if rest, ok := strings.CutPrefix(t, "has:"); ok {
+			filters = append(filters, rest)
+		}
+	}
+	return filters
+}
+
+func blockSatisfies(bdy *hclsyntax.Body, hasFilters []string) bool {
+	if len(hasFilters) == 0 {
+		return true
+	}
+	for _, path := range hasFilters {
+		if !hasPath(bdy, path) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasPath(bdy *hclsyntax.Body, path string) bool {
+	parts := strings.Split(path, ".")
+	return hasPathRec(bdy, parts)
+}
+
+func hasPathRec(bdy *hclsyntax.Body, parts []string) bool {
+	if len(parts) == 0 {
+		return true
+	}
+	head := parts[0]
+	// Attribute present?
+	if len(parts) == 1 {
+		if _, ok := bdy.Attributes[head]; ok {
+			return true
+		}
+	}
+	// Try nested block with this type
+	for _, bl := range bdy.Blocks {
+		if bl.Type == head {
+			if bl.Body != nil && hasPathRec(bl.Body, parts[1:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func summarizeAttributes(kind string, bl *hclsyntax.Block) string {
+	bdy := bl.Body
+	keys := make([]string, 0, len(bdy.Attributes))
+	for k := range bdy.Attributes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s attributes: %s", kind, strings.Join(keys, ", "))
 }
 
 func extractPatternMatches(content, pattern string) []string {
@@ -738,6 +1625,10 @@ func paginateResults(results []formatter.PatternMatch, offset, limit int) []form
 }
 
 func (s *Server) handleListModuleExamples(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	moduleArgs, err := UnmarshalArgs[struct {
 		ModuleName string `json:"module_name"`
 	}](args)
@@ -745,7 +1636,7 @@ func (s *Server) handleListModuleExamples(args any) map[string]any {
 		return ErrorResponse("Error: Invalid parameters")
 	}
 
-	module, err := s.db.GetModule(moduleArgs.ModuleName)
+	module, err := s.resolveModule(moduleArgs.ModuleName)
 	if err != nil {
 		return ErrorResponse(fmt.Sprintf("Module '%s' not found", moduleArgs.ModuleName))
 	}
@@ -756,7 +1647,7 @@ func (s *Server) handleListModuleExamples(args any) map[string]any {
 	}
 
 	exampleMap := buildExampleMap(files)
-	text := formatter.ExampleList(moduleArgs.ModuleName, exampleMap)
+	text := formatter.ExampleList(module.Name, exampleMap)
 	return SuccessResponse(text)
 }
 
@@ -775,6 +1666,10 @@ func buildExampleMap(files []database.ModuleFile) map[string][]string {
 }
 
 func (s *Server) handleGetExampleContent(args any) map[string]any {
+	if err := s.ensureDB(); err != nil {
+		return ErrorResponse(fmt.Sprintf("Failed to initialize database: %v", err))
+	}
+
 	exampleArgs, err := UnmarshalArgs[struct {
 		ModuleName  string `json:"module_name"`
 		ExampleName string `json:"example_name"`
@@ -783,7 +1678,7 @@ func (s *Server) handleGetExampleContent(args any) map[string]any {
 		return ErrorResponse("Error: Invalid parameters")
 	}
 
-	module, err := s.db.GetModule(exampleArgs.ModuleName)
+	module, err := s.resolveModule(exampleArgs.ModuleName)
 	if err != nil {
 		return ErrorResponse(fmt.Sprintf("Module '%s' not found", exampleArgs.ModuleName))
 	}
@@ -799,7 +1694,7 @@ func (s *Server) handleGetExampleContent(args any) map[string]any {
 	}
 
 	sortedFiles := sortExampleFiles(exampleFiles)
-	text := formatter.ExampleContent(exampleArgs.ModuleName, exampleArgs.ExampleName, sortedFiles)
+	text := formatter.ExampleContent(module.Name, exampleArgs.ExampleName, sortedFiles)
 	return SuccessResponse(text)
 }
 
@@ -969,4 +1864,22 @@ func (s *Server) sendError(code int, message string, id any) {
 		},
 	}
 	s.sendResponse(response)
+}
+
+func (s *Server) resolveModule(nameOrAlias string) (*database.Module, error) {
+	if m, err := s.db.GetModule(nameOrAlias); err == nil {
+		return m, nil
+	}
+	if m, err := s.db.ResolveModuleByAlias(nameOrAlias); err == nil {
+		return m, nil
+	}
+	if m, err := s.db.ResolveModuleByAliasPrefix(nameOrAlias); err == nil {
+		return m, nil
+	}
+	mods, err := s.db.SearchModules(nameOrAlias, 1)
+	if err == nil && len(mods) > 0 {
+		m := mods[0]
+		return &m, nil
+	}
+	return nil, fmt.Errorf("module not found for '%s'", nameOrAlias)
 }

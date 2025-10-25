@@ -36,6 +36,5 @@ func SyncProgress(progress *indexer.SyncProgress) string {
 			text.WriteString(fmt.Sprintf("- %s\n", err))
 		}
 	}
-
 	return text.String()
 }

@@ -2,24 +2,19 @@ server:
   port: 3000
   debug: false
   cache_ttl: "1h"
-
 modules:
   base_path: "."
   include_patterns:
     - "terraform-*"
-
   exclude_patterns:
     - "*.git*"
     - "*/.terraform/*"
     - "*/node_modules/*"
-
   refresh_interval: "5m"
-
 categorization:
   min_word_length: 3
   min_cooccurrence: 2
   auto_learn: true
-
 search:
   default_limit: 10
   max_limit: 100
