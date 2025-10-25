@@ -83,6 +83,28 @@ func ModuleInfo(module *database.Module, variables []database.ModuleVariable, ou
 	return text.String()
 }
 
+func StructuralSummaryValues(resourceCount, lifecycleCount, withIgnore int, topResourceTypes, dynamicLabels []string) string {
+	var text strings.Builder
+	text.WriteString("## Structural Summary\n\n")
+	text.WriteString(fmt.Sprintf("- Resources: %d\n", resourceCount))
+	text.WriteString(fmt.Sprintf("- Lifecycle blocks: %d\n", lifecycleCount))
+	if withIgnore > 0 {
+		text.WriteString(fmt.Sprintf("- Resources with lifecycle.ignore_changes: %d\n", withIgnore))
+	}
+	if len(topResourceTypes) > 0 {
+		text.WriteString("- Top resource types: ")
+		text.WriteString(strings.Join(topResourceTypes, ", "))
+		text.WriteString("\n")
+	}
+	if len(dynamicLabels) > 0 {
+		text.WriteString("- Dynamic labels: ")
+		text.WriteString(strings.Join(dynamicLabels, ", "))
+		text.WriteString("\n")
+	}
+	text.WriteString("\n")
+	return text.String()
+}
+
 func VariablesSection(variables []database.ModuleVariable) string {
 	var text strings.Builder
 	text.WriteString("## Variables\n\n")

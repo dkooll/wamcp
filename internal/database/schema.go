@@ -88,6 +88,43 @@ CREATE INDEX IF NOT EXISTS idx_module_resources_type ON module_resources(resourc
 CREATE INDEX IF NOT EXISTS idx_module_data_sources_module_id ON module_data_sources(module_id);
 CREATE INDEX IF NOT EXISTS idx_module_examples_module_id ON module_examples(module_id);
 
+-- HCL block index for fast AST-based queries
+CREATE TABLE IF NOT EXISTS hcl_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    block_type TEXT NOT NULL, -- resource|dynamic|lifecycle
+    type_label TEXT,          -- e.g., azurerm_storage_account for resource, or label for dynamic
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    attr_paths TEXT,          -- newline-separated flattened attribute paths within this block (e.g., "for_each\nlifecycle.ignore_changes")
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_hcl_blocks_module ON hcl_blocks(module_id);
+CREATE INDEX IF NOT EXISTS idx_hcl_blocks_type ON hcl_blocks(block_type);
+CREATE INDEX IF NOT EXISTS idx_hcl_blocks_label ON hcl_blocks(type_label);
+
+CREATE TABLE IF NOT EXISTS hcl_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    block_type TEXT NOT NULL,
+    block_labels TEXT,
+    attribute_path TEXT NOT NULL,
+    reference_type TEXT NOT NULL,
+    reference_name TEXT NOT NULL,
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_hcl_relationships_module ON hcl_relationships(module_id);
+CREATE INDEX IF NOT EXISTS idx_hcl_relationships_ref ON hcl_relationships(module_id, reference_name);
+CREATE INDEX IF NOT EXISTS idx_hcl_relationships_attr ON hcl_relationships(module_id, attribute_path);
+CREATE INDEX IF NOT EXISTS idx_hcl_relationships_ref_only ON hcl_relationships(reference_name);
+CREATE INDEX IF NOT EXISTS idx_hcl_relationships_attr_only ON hcl_relationships(attribute_path);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS modules_fts USING fts5(
     name,
     description,
@@ -138,5 +175,31 @@ END;
 CREATE TRIGGER IF NOT EXISTS files_fts_delete AFTER DELETE ON module_files BEGIN
     DELETE FROM files_fts WHERE rowid = old.id;
 END;
-`
 
+-- Auto-generated and user-defined aliases for modules
+CREATE TABLE IF NOT EXISTS module_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id INTEGER NOT NULL,
+    alias TEXT NOT NULL,
+    weight INTEGER DEFAULT 1,
+    source TEXT,
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE,
+    UNIQUE(module_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alias_alias ON module_aliases(alias);
+CREATE INDEX IF NOT EXISTS idx_alias_module_id ON module_aliases(module_id);
+
+CREATE TABLE IF NOT EXISTS module_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_id INTEGER NOT NULL,
+    tag TEXT NOT NULL,
+    weight INTEGER DEFAULT 1,
+    source TEXT,
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE,
+    UNIQUE(module_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_module_tags_module_id ON module_tags(module_id);
+CREATE INDEX IF NOT EXISTS idx_module_tags_tag ON module_tags(tag);
+`
