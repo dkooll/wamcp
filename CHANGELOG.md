@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/dkooll/wamcp/compare/v1.1.0...v1.1.1) (2025-10-28)
+
+
+### Bug Fixes
+
+* handle notifications/initialized in MCP protocol handshake ([#5](https://github.com/dkooll/wamcp/issues/5)) ([af18811](https://github.com/dkooll/wamcp/commit/af18811f58ffd50f834c0cd193215c4794e62b5d))
+
 ## [1.1.0](https://github.com/dkooll/wamcp/compare/v1.0.0...v1.1.0) (2025-10-25)
 
 
